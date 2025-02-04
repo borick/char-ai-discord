@@ -158,22 +158,12 @@ async function transcribeAudio(buffer) {
     return result?.results?.channels[0]?.alternatives[0]?.transcript || '';
 }
 
-async function downloadFile(url, tempFilePath) {
-    return new Promise((resolve, reject) => {
-        const file = fs.createWriteStream(tempFilePath);
-        https.get(url, (response) => {
-            if (response.statusCode !== 200) {
-                return reject(new Error(`Failed to download file. Status code: ${response.statusCode}`));
-            }
-            response.pipe(file);
-            file.on('finish', () => {
-                file.close(resolve);
-            });
-        }).on('error', (err) => {
-            fs.unlink(tempFilePath, () => reject(err));
-        });
-    });
-}
+/**
+ * Went with a basic approach of just downloading the file because I could not get streaming via ffmpeg to work.
+ * @param {*} url url to download
+ * @param {*} tempFilePath path to download it
+ * @returns nothing
+ */
 async function downloadFile(url, tempFilePath) {
     return new Promise((resolve, reject) => {
         const file = fs.createWriteStream(tempFilePath);
