@@ -1,10 +1,9 @@
 const { Client, GatewayIntentBits, Partials } = require('discord.js');
-const { joinVoiceChannel, createAudioPlayer, createAudioResource, VoiceConnectionStatus, AudioPlayerStatus, StreamType } = require('@discordjs/voice');
+const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, EndBehaviorType } = require('@discordjs/voice');
 const { createClient } = require("@deepgram/sdk");
 const { spawn } = require('child_process');
 const dotenv = require('dotenv');
 const fs = require('fs');
-const { EndBehaviorType } = require("@discordjs/voice");
 const { PassThrough } = require('stream');
 const axios = require('axios');
 const ffmpeg = require('ffmpeg-static');
@@ -57,11 +56,18 @@ client.on('messageCreate', async message => {
         joinVoiceChannelHandler(message);
     }
 
+    if (command === 'joinall') {
+        joinAllVoiceChannelHandler(message);
+    }
+
     if (command === 'leave') {
         leaveVoiceChannelHandler(message);
     }
 });
 
+/**
+ * Handler for the original join command that listens to just the command issuer.
+ */
 async function joinVoiceChannelHandler(message) {
     const voiceChannel = message.member?.voice?.channel;
     if (!voiceChannel) return message.reply('Join a voice channel first!');
@@ -75,6 +81,7 @@ async function joinVoiceChannelHandler(message) {
     });
 
     const receiver = currentConnection.receiver;
+    // Subscribe only to the command issuer
     const recorder = receiver.subscribe(message.member.id, {
         end: {
             behavior: EndBehaviorType.AfterSilence,
@@ -102,19 +109,114 @@ async function joinVoiceChannelHandler(message) {
             const wavBuffer = await convertToWav(Buffer.concat(audioChunks));
             await fs.promises.writeFile('recording.wav', wavBuffer);
             const transcript = await transcribeAudio(wavBuffer);
-            console.log('transcript:', transcript);
-            const response = await getAIResponse(transcript, currentConnection, message);
+
+            // Don't do anything if transcript is empty
+            console.log('Transcript:', transcript);
+            console.log('Empty response retrieved, returning')
+            if (!transcript) return;
+            
+            // Pass autoRestart=true for single-user mode so that we restart the listener after TTS playback.
+            const response = await getAIResponse(transcript, currentConnection, message, true);
             console.log('AI Response:', response);
         } catch (error) {
             console.error('Error processing audio:', error);
-            // message.channel.send("Error processing request");
-            console.log()
         }
     });
 
     message.reply(`Listening to ${message.author.username}...`);
 }
 
+/**
+ * New handler for the joinall command.
+ * This joins the caller's voice channel and subscribes to every non-bot member's audio.
+ */
+async function joinAllVoiceChannelHandler(message) {
+    const voiceChannel = message.member?.voice?.channel;
+    if (!voiceChannel) return message.reply('Join a voice channel first!');
+
+    currentConnection = joinVoiceChannel({
+        channelId: voiceChannel.id,
+        guildId: voiceChannel.guild.id,
+        adapterCreator: voiceChannel.guild.voiceAdapterCreator,
+        selfDeaf: false,
+        selfMute: false
+    });
+
+    message.reply(`Listening to everyone in ${voiceChannel.name}...`);
+
+    const receiver = currentConnection.receiver;
+    // Iterate over all members in the channel (skip bots)
+    voiceChannel.members.forEach(member => {
+        if (member.user.bot) return;
+        listenToUser(member, receiver, message);
+    });
+}
+
+/**
+ * Helper function to listen to a specific user in the voice channel.
+ * When their audio stream ends (after a period of silence), it processes the audio
+ * and then re-subscribes so that the bot keeps listening for that user.
+ */
+function listenToUser(member, receiver, message) {
+    const subscription = receiver.subscribe(member.id, {
+        end: {
+            behavior: EndBehaviorType.AfterSilence,
+            duration: 2000
+        }
+    });
+
+    const opusDecoder = new prism.opus.Decoder({
+        rate: 48000,
+        channels: 1,
+        frameSize: 960
+    });
+
+    let audioChunks = [];
+    const decoderStream = subscription.pipe(opusDecoder);
+
+    decoderStream.on('data', (chunk) => {
+        audioChunks.push(chunk);
+    });
+
+    decoderStream.on('end', async () => {
+        if (audioChunks.length === 0) {
+            // Re-listen if no audio was captured
+            return listenToUser(member, receiver, message);
+        }
+
+        try {
+            const wavBuffer = await convertToWav(Buffer.concat(audioChunks));
+            // Save a temporary file that includes the member's ID in the name (optional)
+            const tempFilename = `recording_${member.id}.wav`;
+            await fs.promises.writeFile(tempFilename, wavBuffer);
+            const transcript = await transcribeAudio(wavBuffer);
+            console.log(`Transcript from ${member.user.username}:`, transcript);
+            // Don't do anything if transcript is empty
+            console.log('Empty response retrieved, returning')
+            if (!transcript) {
+                if (member.voice.channel && member.voice.channel.id === message.member.voice.channel.id) {
+                    listenToUser(member, receiver, message);
+                }
+                return;
+            }
+
+            // Pass autoRestart=false for joinall mode so that we don’t trigger a global re-subscription.
+            const response = await getAIResponse(transcript, currentConnection, message, false);
+            console.log('AI Response:', response);
+        } catch (error) {
+            console.error(`Error processing audio from ${member.user.username}:`, error);
+        }
+
+        // Re-subscribe for this member if they are still in the same voice channel.
+        if (member.voice.channel && member.voice.channel.id === message.member.voice.channel.id) {
+            listenToUser(member, receiver, message);
+        }
+    });
+}
+
+/**
+ * Convert PCM audio buffer to WAV using FFmpeg.
+ */
 async function convertToWav(pcmBuffer) {
     return new Promise((resolve, reject) => {
         ffmpegProcess = spawn(ffmpeg, [
@@ -140,6 +242,9 @@ async function convertToWav(pcmBuffer) {
     });
 }
 
+/**
+ * Transcribe the given audio buffer using Deepgram.
+ */
 async function transcribeAudio(buffer) {
     const { result, error } = await deepgram.listen.prerecorded.transcribeFile(
         buffer,
@@ -154,15 +259,11 @@ async function transcribeAudio(buffer) {
         console.error('Error transcribing audio:', error);
         throw error;
     }
-    // console.log('Result: ', JSON.stringify(result, null, 2));
     return result?.results?.channels[0]?.alternatives[0]?.transcript || '';
 }
 
 /**
- * Went with a basic approach of just downloading the file because I could not get streaming via ffmpeg to work.
- * @param {*} url url to download
- * @param {*} tempFilePath path to download it
- * @returns nothing
+ * Download a file from the given URL and save it at tempFilePath.
  */
 async function downloadFile(url, tempFilePath) {
     return new Promise((resolve, reject) => {
@@ -181,9 +282,13 @@ async function downloadFile(url, tempFilePath) {
     });
 }
 
-async function getAIResponse(prompt, connection, message) {
+/**
+ * Get the AI response for a given prompt.
+ * The optional parameter autoRestart (defaulting to true) determines whether we
+ * automatically re-subscribe for audio after TTS playback finishes.
+ */
+async function getAIResponse(prompt, connection, message, autoRestart = true) {
     try {
-
         let response = null;
         try {
             console.log(caiClient.character);
@@ -211,10 +316,8 @@ async function getAIResponse(prompt, connection, message) {
             console.log(JSON.stringify(response, null, 2));
 
         } catch (error) {
-            // This is OK
             console.log(error);
             if (!response) {
-                // Disconnect from the chat
                 await caiClient.character.disconnect(process.env.CHARACTER_ID);
                 console.log("Disconnected...try again.");
             }
@@ -224,10 +327,9 @@ async function getAIResponse(prompt, connection, message) {
             response["turn"]["turn_key"]["turn_id"],
             response["turn"]["primary_candidate_id"],
             process.env.VOICE_ID,
-        )
+        );
 
-        const replayUrl = ttsReply["replayUrl"]
-        
+        const replayUrl = ttsReply["replayUrl"];
         const tempFilePath = path.join(__dirname, 'temp_audio_file.mp3'); // Temporary file location
 
         console.log('Downloading file...');
@@ -236,37 +338,28 @@ async function getAIResponse(prompt, connection, message) {
         console.log('Starting playback...');
 
         const player = createAudioPlayer();
-        console.log('player created...');
-
-        // Create audio resource from ffmpeg stdout
-        console.log('Temp file: ', tempFilePath);
-
         const resource = createAudioResource(tempFilePath);
-        console.log('Resource created.');
-
         player.play(resource);
-        console.log('Playing resource');
-
         connection.subscribe(player);
-        console.log('Player subscribed to connection.');
 
         player.on("error", (error) => {
             console.error("Error in audio player:", error);
             message.reply("⚠️ An error occurred while playing the audio.");
         });
 
-        player.on(AudioPlayerStatus.Idle, () => {
-            console.log('Playback finished, restarting listener...');
-            joinVoiceChannelHandler(message);  // Restart listening after TTS plays
-        });
+        // Only auto-restart in the single-user (join) case.
+        if (autoRestart) {
+            player.on(AudioPlayerStatus.Idle, () => {
+                console.log('Playback finished, restarting listener...');
+                joinVoiceChannelHandler(message);  // Restart listening after TTS plays
+            });
+        }
 
         ffmpegProcess.on('close', () => {
             fs.unlink(tempFilePath, (err) => {
                 if (err) console.error('Failed to delete temp file:', err);
             });
         });
-
-        console.log('Audio playback started.');
 
         if (play_in_channel) {
             message.reply(`Now playing: ${replayUrl}`);
@@ -280,6 +373,9 @@ async function getAIResponse(prompt, connection, message) {
     }
 }
 
+/**
+ * Handler to leave the voice channel.
+ */
 function leaveVoiceChannelHandler(message) {
     if (currentConnection) {
         currentConnection.destroy();
