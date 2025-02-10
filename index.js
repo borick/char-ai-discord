@@ -12,11 +12,54 @@ const playdl = require('play-dl');
 const https = require('https');
 const path = require('path');
 
-// put message of url in channel
+// When true, sends a message in the text channel with the playback URL.
 const play_in_channel = false;
 
 let ffmpegProcess = null;
 let caiClient = null;
+
+// Global audio queue and flag to prevent simultaneous playbacks.
+const audioQueue = [];
+let isPlayingAudio = false;
+
+// Global variable to store the voice channel ID being listened to (for joinall mode)
+let listeningChannelId = null;
+
+/**
+ * Processes the audio queue. If something is already playing or the queue is empty,
+ * it does nothing. Otherwise, it dequeues the next audio, plays it, and once finished,
+ * cleans up and recursively processes the next item.
+ */
+function processAudioQueue() {
+    if (isPlayingAudio || audioQueue.length === 0) return;
+    isPlayingAudio = true;
+
+    const { connection, tempFilePath, message, autoRestart } = audioQueue.shift();
+
+    const player = createAudioPlayer();
+    const resource = createAudioResource(tempFilePath);
+    connection.subscribe(player);
+    player.play(resource);
+
+    player.on(AudioPlayerStatus.Idle, () => {
+        isPlayingAudio = false;
+        fs.unlink(tempFilePath, (err) => {
+            if (err) console.error('Failed to delete temp file:', err);
+        });
+        // In single-user mode, restart listening after playback finishes.
+        if (autoRestart) {
+            joinVoiceChannelHandler(message);
+        }
+        processAudioQueue();
+    });
+
+    player.on('error', (error) => {
+        console.error("Error in audio player:", error);
+        message.reply("⚠️ An error occurred while playing the audio.");
+        isPlayingAudio = false;
+        processAudioQueue();
+    });
+}
 
 (async function() {
     caiClient = new (await import("cainode")).CAINode();
@@ -80,6 +123,9 @@ async function joinVoiceChannelHandler(message) {
         selfMute: false
     });
 
+    // Clear the global channel tracker (this is single-user mode)
+    listeningChannelId = null;
+
     const receiver = currentConnection.receiver;
     // Subscribe only to the command issuer
     const recorder = receiver.subscribe(message.member.id, {
@@ -110,10 +156,11 @@ async function joinVoiceChannelHandler(message) {
             await fs.promises.writeFile('recording.wav', wavBuffer);
             const transcript = await transcribeAudio(wavBuffer);
 
-            // Don't do anything if transcript is empty
             console.log('Transcript:', transcript);
-            console.log('Empty response retrieved, returning')
-            if (!transcript) return;
+            if (!transcript) {
+                console.log('Empty response retrieved, returning');
+                return;
+            }
             
             // Pass autoRestart=true for single-user mode so that we restart the listener after TTS playback.
             const response = await getAIResponse(transcript, currentConnection, message, true);
@@ -134,6 +181,9 @@ async function joinAllVoiceChannelHandler(message) {
     const voiceChannel = message.member?.voice?.channel;
     if (!voiceChannel) return message.reply('Join a voice channel first!');
 
+    // Store the channel ID globally for joinall mode
+    listeningChannelId = voiceChannel.id;
+
     currentConnection = joinVoiceChannel({
         channelId: voiceChannel.id,
         guildId: voiceChannel.guild.id,
@@ -145,10 +195,10 @@ async function joinAllVoiceChannelHandler(message) {
     message.reply(`Listening to everyone in ${voiceChannel.name}...`);
 
     const receiver = currentConnection.receiver;
-    // Iterate over all members in the channel (skip bots)
+    // Subscribe to all current non-bot members in the channel
     voiceChannel.members.forEach(member => {
         if (member.user.bot) return;
-        listenToUser(member, receiver, message);
+        listenToUser(member, receiver, { voiceChannel });
     });
 }
 
@@ -157,7 +207,7 @@ async function joinAllVoiceChannelHandler(message) {
  * When their audio stream ends (after a period of silence), it processes the audio
  * and then re-subscribes so that the bot keeps listening for that user.
  */
-function listenToUser(member, receiver, message) {
+function listenToUser(member, receiver, context) {
     const subscription = receiver.subscribe(member.id, {
         end: {
             behavior: EndBehaviorType.AfterSilence,
@@ -181,7 +231,7 @@ function listenToUser(member, receiver, message) {
     decoderStream.on('end', async () => {
         if (audioChunks.length === 0) {
             // Re-listen if no audio was captured
-            return listenToUser(member, receiver, message);
+            return listenToUser(member, receiver, context);
         }
 
         try {
@@ -191,28 +241,51 @@ function listenToUser(member, receiver, message) {
             await fs.promises.writeFile(tempFilename, wavBuffer);
             const transcript = await transcribeAudio(wavBuffer);
             console.log(`Transcript from ${member.user.username}:`, transcript);
-            // Don't do anything if transcript is empty
-            console.log('Empty response retrieved, returning')
             if (!transcript) {
-                if (member.voice.channel && member.voice.channel.id === message.member.voice.channel.id) {
-                    listenToUser(member, receiver, message);
+                console.log('Empty response retrieved, returning');
+                // Re-subscribe if still in the same channel
+                if (member.voice.channel && ((listeningChannelId && member.voice.channel.id === listeningChannelId) ||
+                    (context && context.voiceChannel && member.voice.channel.id === context.voiceChannel.id))) {
+                    listenToUser(member, receiver, context);
                 }
                 return;
             }
 
             // Pass autoRestart=false for joinall mode so that we don’t trigger a global re-subscription.
-            const response = await getAIResponse(transcript, currentConnection, message, false);
+            const response = await getAIResponse(transcript, currentConnection, { reply: () => {} }, false);
             console.log('AI Response:', response);
         } catch (error) {
             console.error(`Error processing audio from ${member.user.username}:`, error);
         }
 
-        // Re-subscribe for this member if they are still in the same voice channel.
-        if (member.voice.channel && member.voice.channel.id === message.member.voice.channel.id) {
-            listenToUser(member, receiver, message);
+        // Re-subscribe for this member if they are still in the channel
+        if (member.voice.channel) {
+            if (listeningChannelId) {
+                if (member.voice.channel.id === listeningChannelId) {
+                    listenToUser(member, receiver, context);
+                }
+            } else if (context && context.voiceChannel && member.voice.channel.id === context.voiceChannel.id) {
+                listenToUser(member, receiver, context);
+            }
         }
     });
 }
+
+/**
+ * Listen for new members joining the voice channel in joinall mode.
+ * This ensures that users who join after the command is issued are also subscribed.
+ */
+client.on('voiceStateUpdate', (oldState, newState) => {
+    // If a new member joins a voice channel and is not a bot...
+    if (newState.channelId && !newState.member.user.bot) {
+        // ...and if we're in joinall mode and the new member joined the channel we're listening to...
+        if (currentConnection && listeningChannelId && newState.channelId === listeningChannelId) {
+            console.log(`New member joined: ${newState.member.user.username}`);
+            const receiver = currentConnection.receiver;
+            listenToUser(newState.member, receiver, { voiceChannel: newState.member.voice.channel });
+        }
+    }
+});
 
 /**
  * Convert PCM audio buffer to WAV using FFmpeg.
@@ -302,7 +375,7 @@ async function getAIResponse(prompt, connection, message, autoRestart = true) {
                     console.log("Error disconnecting from group: " + group['id']);
                 }
             }
-            try { 
+            try {
                 await caiClient.character.disconnect(process.env.CHARACTER_ID);
             } catch (error) {
                 console.log("Error disconnecting from character: " + process.env.CHARACTER_ID);
@@ -314,7 +387,6 @@ async function getAIResponse(prompt, connection, message, autoRestart = true) {
                 timeout_ms: 10000,
             });
             console.log(JSON.stringify(response, null, 2));
-
         } catch (error) {
             console.log(error);
             if (!response) {
@@ -335,33 +407,12 @@ async function getAIResponse(prompt, connection, message, autoRestart = true) {
         console.log('Downloading file...');
         await downloadFile(replayUrl, tempFilePath);
 
-        console.log('Starting playback...');
+        console.log('Queueing playback...');
+        // Instead of playing the audio immediately, add it to the queue.
+        audioQueue.push({ connection, tempFilePath, message, autoRestart });
+        processAudioQueue();
 
-        const player = createAudioPlayer();
-        const resource = createAudioResource(tempFilePath);
-        player.play(resource);
-        connection.subscribe(player);
-
-        player.on("error", (error) => {
-            console.error("Error in audio player:", error);
-            message.reply("⚠️ An error occurred while playing the audio.");
-        });
-
-        // Only auto-restart in the single-user (join) case.
-        if (autoRestart) {
-            player.on(AudioPlayerStatus.Idle, () => {
-                console.log('Playback finished, restarting listener...');
-                joinVoiceChannelHandler(message);  // Restart listening after TTS plays
-            });
-        }
-
-        ffmpegProcess.on('close', () => {
-            fs.unlink(tempFilePath, (err) => {
-                if (err) console.error('Failed to delete temp file:', err);
-            });
-        });
-
-        if (play_in_channel) {
+        if (play_in_channel && message && typeof message.reply === 'function') {
             message.reply(`Now playing: ${replayUrl}`);
         }
         console.log(JSON.stringify(ttsReply, null, 2));
@@ -380,6 +431,7 @@ function leaveVoiceChannelHandler(message) {
     if (currentConnection) {
         currentConnection.destroy();
         currentConnection = null;
+        listeningChannelId = null;
         message.reply('Left the voice channel!');
     }
 }
