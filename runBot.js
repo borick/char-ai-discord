@@ -417,8 +417,8 @@ async function getAIResponse(prompt, connection, message, autoRestart = true, me
             // get list of group chats
             const chats = await caiClient.group_chat.list();
             console.log(chats);
-            const chat = chats[0];
-            chatId = chat ? chat.chatId : null;
+            const chat = chats["rooms"];
+            chatId = chat ? chat[0].id : null;
             if (chatId) {
                 userConversations.set(member.id, chatId);
             } else {
@@ -428,10 +428,10 @@ async function getAIResponse(prompt, connection, message, autoRestart = true, me
         }
 
         try {
-            response = await caiClient.character.send_message(prompt, false, "", {
+            response = await caiClient.character.send_message(prompt, true, "", {
                 char_id: process.env.CHARACTER_ID,
                 chat_id: chatId,
-                timeout_ms: 10000,
+                timeout_ms: 30000,
             });
             console.log(`Response for ${member.user.username}:`, JSON.stringify(response, null, 2));
         } catch (error) {
@@ -442,15 +442,29 @@ async function getAIResponse(prompt, connection, message, autoRestart = true, me
             }
         }
 
-        const ttsReply = await caiClient.character.replay_tts(
-            response["turn"]["turn_key"]["turn_id"],
-            response["turn"]["primary_candidate_id"],
-            process.env.VOICE_ID,
+        console.log(`Response for ${member.user.username}:`, JSON.stringify(response, null, 2));
+        const candidateId = response["turn"]["primary_candidate_id"];
+        console.log(`Turn ID: ${candidateId}, Candidate ID: ${candidateId}`);
+        let ttsReply = await caiClient.character.replay_tts(
+            candidateId, candidateId, process.env.VOICE_ID,
         );
 
+        console.log(`TTS Reply for ${member.user.username}:`, JSON.stringify(ttsReply, null, 2));
+
+        // While the ttsReply doesn't contain "replayUrl", loop until it does
+        while (!ttsReply["replayUrl"]) {
+            console.log("Trying to get a new TTS reply...")
+            const responseTry = await caiClient.character.generate_turn();
+            const candidateId = responseTry["turn"]["primary_candidate_id"];
+            console.log(`Response for ${member.user.username}:`, JSON.stringify(responseTry, null, 2));
+            ttsReply = await caiClient.character.replay_tts(
+                candidateId, candidateId, process.env.VOICE_ID,
+            );
+            console.log(`TTS Reply for ${member.user.username}:`, JSON.stringify(ttsReply, null, 2));
+        }
         const replayUrl = ttsReply["replayUrl"];
         // Instead of downloading the entire file to disk, we stream it.
-        console.log(`Streaming file for ${member.user.username} from:`, replayUrl);
+        console.log(`Streaming file ${replayUrl} for ${member.user.username} from:`, replayUrl);
         const ttsStreamResponse = await axios.get(replayUrl, { responseType: 'stream' });
 
         console.log(`Queueing playback for ${member.user.username}...`);
