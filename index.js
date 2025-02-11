@@ -402,7 +402,8 @@ async function getAIResponse(prompt, connection, message, autoRestart = true) {
         );
 
         const replayUrl = ttsReply["replayUrl"];
-        const tempFilePath = path.join(__dirname, 'temp_audio_file.mp3'); // Temporary file location
+        const tempName = `temp_audio_file_${Date.now()}.mp3`;
+        const tempFilePath = path.join(__dirname, tempName); // Temporary file location
 
         console.log('Downloading file...');
         await downloadFile(replayUrl, tempFilePath);
