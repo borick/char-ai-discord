@@ -1,5 +1,12 @@
 const { Client, GatewayIntentBits, Partials } = require('discord.js');
-const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, EndBehaviorType } = require('@discordjs/voice');
+const { 
+    joinVoiceChannel, 
+    createAudioPlayer, 
+    createAudioResource, 
+    AudioPlayerStatus, 
+    EndBehaviorType, 
+    StreamType 
+} = require('@discordjs/voice');
 const { createClient } = require("@deepgram/sdk");
 const { spawn } = require('child_process');
 const dotenv = require('dotenv');
@@ -34,18 +41,29 @@ function processAudioQueue() {
     if (isPlayingAudio || audioQueue.length === 0) return;
     isPlayingAudio = true;
 
-    const { connection, tempFilePath, message, autoRestart } = audioQueue.shift();
+    // Each queue item can now have either a 'stream' or a 'tempFilePath'
+    const { connection, stream, tempFilePath, message, autoRestart } = audioQueue.shift();
 
     const player = createAudioPlayer();
-    const resource = createAudioResource(tempFilePath);
+    let resource;
+    if (stream) {
+        // When using streaming audio, explicitly set the inputType
+        resource = createAudioResource(stream, { inputType: StreamType.Arbitrary });
+    } else {
+        // Fallback to file-based resource (if needed)
+        resource = createAudioResource(fs.createReadStream(tempFilePath));
+    }
     connection.subscribe(player);
     player.play(resource);
 
     player.on(AudioPlayerStatus.Idle, () => {
         isPlayingAudio = false;
-        fs.unlink(tempFilePath, (err) => {
-            if (err) console.error('Failed to delete temp file:', err);
-        });
+        if (tempFilePath) {
+            // Only delete if a temporary file was used
+            fs.unlink(tempFilePath, (err) => {
+                if (err) console.error('Failed to delete temp file:', err);
+            });
+        }
         // In single-user mode, restart listening after playback finishes.
         if (autoRestart) {
             joinVoiceChannelHandler(message);
@@ -336,26 +354,6 @@ async function transcribeAudio(buffer) {
 }
 
 /**
- * Download a file from the given URL and save it at tempFilePath.
- */
-async function downloadFile(url, tempFilePath) {
-    return new Promise((resolve, reject) => {
-        const file = fs.createWriteStream(tempFilePath);
-        https.get(url, (response) => {
-            if (response.statusCode !== 200) {
-                return reject(new Error(`Failed to download file. Status code: ${response.statusCode}`));
-            }
-            response.pipe(file);
-            file.on('finish', () => {
-                file.close(resolve);
-            });
-        }).on('error', (err) => {
-            fs.unlink(tempFilePath, () => reject(err));
-        });
-    });
-}
-
-/**
  * Get the AI response for a given prompt.
  * The optional parameter autoRestart (defaulting to true) determines whether we
  * automatically re-subscribe for audio after TTS playback finishes.
@@ -364,23 +362,7 @@ async function getAIResponse(prompt, connection, message, autoRestart = true) {
     try {
         let response = null;
         try {
-            console.log(caiClient.character);
-
-            const gc = await caiClient.group_chat.list();
-            for (const group of gc["rooms"]) {
-                console.log("disconnecting from group: " + group['id']);
-                try {
-                    await caiClient.group_chat.disconnect(group['id']);
-                } catch (error) {
-                    console.log("Error disconnecting from group: " + group['id']);
-                }
-            }
-            try {
-                await caiClient.character.disconnect(process.env.CHARACTER_ID);
-            } catch (error) {
-                console.log("Error disconnecting from character: " + process.env.CHARACTER_ID);
-            }
-            
+            await PromisescaiClient.group_chat.connect(process.env.CHARACTER_ID);
             await caiClient.character.connect(process.env.CHARACTER_ID);
             response = await caiClient.character.send_message(prompt, false, "", {
                 char_id: process.env.CHARACTER_ID,
@@ -402,15 +384,13 @@ async function getAIResponse(prompt, connection, message, autoRestart = true) {
         );
 
         const replayUrl = ttsReply["replayUrl"];
-        const tempName = `temp_audio_file_${Date.now()}.mp3`;
-        const tempFilePath = path.join(__dirname, tempName); // Temporary file location
-
-        console.log('Downloading file...');
-        await downloadFile(replayUrl, tempFilePath);
-
+        // Instead of downloading the entire file to disk, we stream it.
+        console.log('Streaming file from:', replayUrl);
+        const ttsStreamResponse = await axios.get(replayUrl, { responseType: 'stream' });
+        
         console.log('Queueing playback...');
-        // Instead of playing the audio immediately, add it to the queue.
-        audioQueue.push({ connection, tempFilePath, message, autoRestart });
+        // Queue an item with the audio stream
+        audioQueue.push({ connection, stream: ttsStreamResponse.data, message, autoRestart });
         processAudioQueue();
 
         if (play_in_channel && message && typeof message.reply === 'function') {
