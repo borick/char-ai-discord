@@ -25,21 +25,35 @@ dotenv.config();
     console.log(`Connecting to character [${process.env.CHARACTER_ID}]...`);
     await caiClient.character.connect(process.env.CHARACTER_ID);
 
-    console.log("Listing active group chats...");
-    // List active chats; each chat object is assumed to have a "chatId" property.
-    const chats = await caiClient.group_chat.list();
-    if (chats && chats.length > 0) {
-      chats.forEach((chat, index) => {
-        console.log(`${index + 1}. Chat ID: ${chat.chatId}`);
+    if (process.argv[2] == "delete_all_rooms") {
+      
+      console.log("Deleting all group chats...");
+
+      const chats = await caiClient.group_chat.list();
+      const chatRooms = chats["rooms"];
+      console.log(chatRooms);
+      chatRooms.forEach((value, index) => {
+        console.log("deleting room: ", value.id);
+        caiClient.group_chat.delete(value.id);
       });
+
+    } else if (process.argv[2] == "list_rooms") {
+      
+      console.log("Listing active group chats...");
+      
+      const chats = await caiClient.group_chat.list();
+      const chatRooms = chats["rooms"];
+      if (chatRooms && chatRooms.length > 0) {
+        chatRooms.forEach((rooms, index) => {
+          console.log(`${index + 1}. Chat ID: ${rooms.id}`);
+        });
+      } else {
+        console.log("No active chats found.");
+      }
     } else {
-      console.log("No active chats found.");
+      console.log("Invalid command line argument.");
     }
 
-    console.log("Disconnecting from character...");
-    await caiClient.character.disconnect(process.env.CHARACTER_ID);
-    console.log("Disconnected successfully.");
-    process.exit(0);
   } catch (error) {
     console.error("An error occurred:", error);
     process.exit(1);

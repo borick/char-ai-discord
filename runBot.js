@@ -44,8 +44,8 @@ const userConversations = new Map();
     caiClient = new (await import("cainode")).CAINode();
     console.log("Logging in...");
     await caiClient.login(process.env.CHARACTER_AI_TOKEN);
-    console.log(`Connecting to character [${process.env.CHARACTER_ID}]...`);
-    await caiClient.character.connect(process.env.CHARACTER_ID);
+    // console.log(`Connecting to character [${process.env.CHARACTER_ID}]...`);
+    // await caiClient.character.connect(process.env.CHARACTER_ID);
 })();
 
 const client = new Client({
@@ -173,7 +173,6 @@ async function joinVoiceChannelHandler(message, isRejoin = false) {
 
     // Subscribe only to the command issuer
     listenToUser(message.member, receiver, { message });
-
     if (!isRejoin) message.reply(`Listening to ${message.author.username}...`);
 }
 
@@ -222,7 +221,8 @@ async function joinAllVoiceChannelHandler(message, isRejoin = false) {
  * When their audio stream ends (after a period of silence), it processes the audio
  * and then re-subscribes so that the bot keeps listening for that user.
  */
-function listenToUser(member, receiver, context) {
+function listenToUser(member, receiver, context, message) {
+    console.log(`Listening to ${member.user.username}...`);
     // Check if there's already an active listener
     if (activeListeners.has(member.id)) {
         console.log(`Already listening to ${member.user.username}, skipping.`);
@@ -251,6 +251,8 @@ function listenToUser(member, receiver, context) {
 
     decoderStream.on('end', async () => {
         if (audioChunks.length === 0) {
+            // Remove the old listener record before re-subscribing
+            activeListeners.delete(member.id);
             // Re-listen if no audio was captured
             resubscribeIfNecessary(member, receiver, context);
             return;
@@ -261,23 +263,25 @@ function listenToUser(member, receiver, context) {
             // Optionally save the recording
             // const tempFilename = `recording_${member.id}.wav`;
             // await fs.promises.writeFile(tempFilename, wavBuffer);
-
             const transcript = await transcribeAudio(wavBuffer);
             console.log(`Transcript from ${member.user.username}:`, transcript);
 
             if (!transcript) {
                 console.log('Empty response retrieved, returning');
+                // Remove the listener record so we can re-subscribe later
+                activeListeners.delete(member.id);
                 resubscribeIfNecessary(member, receiver, context);
                 return;
             }
 
             // Pass the member object to maintain conversation context
-            await getAIResponse(transcript, currentConnection, { reply: () => {} }, false, member);
+            await getAIResponse(transcript, currentConnection, { voiceChannel: member.voice.channel }, true, member);
         } catch (error) {
             console.error(`Error processing audio from ${member.user.username}:`, error);
         }
 
-        // Re-subscribe for this member if they are still in the channel
+        // IMPORTANT: Clear the listener record to allow re-subscription
+        activeListeners.delete(member.id);
         resubscribeIfNecessary(member, receiver, context);
     });
 
@@ -298,6 +302,7 @@ function listenToUser(member, receiver, context) {
  * Helper function to re-subscribe to a user if necessary.
  */
 function resubscribeIfNecessary(member, receiver, context) {
+    console.log(`Re-subscribing to ${JSON.stringify(member, null, 2)}...`);
     if (member.voice.channel) {
         if (listeningChannelId && member.voice.channel.id === listeningChannelId) {
             if (!activeListeners.has(member.id)) {
@@ -307,6 +312,8 @@ function resubscribeIfNecessary(member, receiver, context) {
             if (!activeListeners.has(member.id)) {
                 listenToUser(member, receiver, context);
             }
+        } else {
+            listenToUser(member, receiver, context);
         }
     } else {
         // Remove the listener and conversation if the user is no longer in the channel
@@ -407,28 +414,32 @@ async function transcribeAudio(buffer) {
  * The optional parameter autoRestart (defaulting to true) determines whether we
  * automatically re-subscribe for audio after TTS playback finishes.
  */
-async function getAIResponse(prompt, connection, message, autoRestart = true, member) {
+async function getAIResponse(prompt, connection, message, autoRestart, member) {
+    console.log(`Getting AI response debug for ${member.user.username}:`, prompt);
+    console.log("Message: ", JSON.stringify(message, null, 2));
+
     try {
         let response = null;
-        let chatId = userConversations.get(member.id);
+        // Try to retrieve the conversation context for the user
+        let chatId = userConversations.get(process.env.CHARACTER_ID);
 
+        // If no chat exists, start a new conversation.
         if (!chatId) {
-            // Start a new chat and store the chat ID
-            // get list of group chats
-            const chats = await caiClient.group_chat.list();
-            console.log(chats);
-            const chat = chats["rooms"];
-            chatId = chat ? chat[0].id : null;
+            console.log("No chat found for user, starting a new one...");
+            const chats = await caiClient.character.connect(process.env.CHARACTER_ID);
+            const chatList = chats["chats"];
+            chatId = chatList[0]["chat_id"];
             if (chatId) {
-                userConversations.set(member.id, chatId);
+                userConversations.set(process.env.CHARACTER_ID, chatId);
             } else {
-                console.error(`Failed to start new chat for ${member.user.username}`);
+                console.error(`Failed to start new chat for ${process.env.CHARACTER_ID}`);
                 return;
             }
         }
 
+        // Send the message to the AI
         try {
-            response = await caiClient.character.send_message(prompt, true, "", {
+            response = await caiClient.character.send_message(prompt, false, "", {
                 char_id: process.env.CHARACTER_ID,
                 chat_id: chatId,
                 timeout_ms: 30000,
@@ -444,31 +455,27 @@ async function getAIResponse(prompt, connection, message, autoRestart = true, me
 
         console.log(`Response for ${member.user.username}:`, JSON.stringify(response, null, 2));
         const candidateId = response["turn"]["primary_candidate_id"];
-        console.log(`Turn ID: ${candidateId}, Candidate ID: ${candidateId}`);
-        let ttsReply = await caiClient.character.replay_tts(
-            candidateId, candidateId, process.env.VOICE_ID,
-        );
+        const turnId = response["turn"]["turn_key"]["turn_id"];
+        console.log(`Turn ID: ${turnId}, Candidate ID: ${candidateId}`);
 
+        let ttsReply = await caiClient.character.replay_tts(
+            turnId, candidateId, process.env.VOICE_ID,
+        );
         console.log(`TTS Reply for ${member.user.username}:`, JSON.stringify(ttsReply, null, 2));
 
-        // While the ttsReply doesn't contain "replayUrl", loop until it does
-        while (!ttsReply["replayUrl"]) {
-            console.log("Trying to get a new TTS reply...")
-            const responseTry = await caiClient.character.generate_turn();
-            const candidateId = responseTry["turn"]["primary_candidate_id"];
-            console.log(`Response for ${member.user.username}:`, JSON.stringify(responseTry, null, 2));
-            ttsReply = await caiClient.character.replay_tts(
-                candidateId, candidateId, process.env.VOICE_ID,
-            );
-            console.log(`TTS Reply for ${member.user.username}:`, JSON.stringify(ttsReply, null, 2));
+        // Instead of an indefinite loop that exits the process, check once and handle gracefully.
+        if (!ttsReply["replayUrl"]) {
+            console.error(`TTS reply did not contain a replayUrl for ${member.user.username}, skipping TTS playback.`);
+            return;
         }
         const replayUrl = ttsReply["replayUrl"];
-        // Instead of downloading the entire file to disk, we stream it.
+
+        // Stream the TTS audio from the URL
         console.log(`Streaming file ${replayUrl} for ${member.user.username} from:`, replayUrl);
         const ttsStreamResponse = await axios.get(replayUrl, { responseType: 'stream' });
 
         console.log(`Queueing playback for ${member.user.username}...`);
-        // Queue an item with the audio stream
+        // Queue the audio stream for playback
         audioQueue.push({ connection, stream: ttsStreamResponse.data, message, autoRestart });
         processAudioQueue();
 
@@ -483,6 +490,7 @@ async function getAIResponse(prompt, connection, message, autoRestart = true, me
         throw error;
     }
 }
+
 
 /**
  * Processes the audio queue. If something is already playing or the queue is empty,
@@ -500,9 +508,11 @@ function processAudioQueue() {
     let resource;
     if (stream) {
         // When using streaming audio, explicitly set the inputType
+        console.log('Creating audio resource from stream...');
         resource = createAudioResource(stream, { inputType: StreamType.Arbitrary });
     } else {
         // Fallback to file-based resource (if needed)
+        console.log('Creating audio resource from file...');
         resource = createAudioResource(fs.createReadStream(tempFilePath));
     }
     connection.subscribe(player);
@@ -516,10 +526,11 @@ function processAudioQueue() {
                 if (err) console.error('Failed to delete temp file:', err);
             });
         }
+
         // In single-user mode, restart listening after playback finishes.
-        if (autoRestart && message && message.member) {
-            joinVoiceChannelHandler(message);
-        }
+        console.log('Finished playback.');
+        console.log('Auto-restart:', autoRestart);
+        console.log('Message:', JSON.stringify(message, null, 2));
         processAudioQueue();
     });
 
@@ -557,4 +568,15 @@ function leaveVoiceChannelHandler(message) {
     }
 }
 
+process.on('SIGINT', async () => {
+    console.log('Disconnecting...');
+    if (currentConnection) {
+        currentConnection.destroy();
+    }
+    await caiClient.character.disconnect(process.env.CHARACTER_ID);
+    process.exit();
+});
+
 client.login(process.env.DISCORD_BOT_TOKEN);
+
+
