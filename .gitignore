@@ -2,3 +2,4 @@
 node_modules
 temp_audio_file.mp3
 *.wav
+botState.json
