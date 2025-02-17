@@ -42,8 +42,12 @@ let globalTextChannel = null;
 // Map to keep track of active listeners per user
 const activeListeners = new Map();
 
-// Map to store conversation contexts per user
+// Map to store conversation contexts per user (currently used for chat session IDs)
 const userConversations = new Map();
+
+// Global variables for accumulating transcripts
+let accumulatedTranscript = "";
+let accumulationTimer = null;
 
 (async function() {
   caiClient = new (await import("cainode")).CAINode();
@@ -299,8 +303,18 @@ function listenToUser(member, receiver, context) {
         sendReply(context.message, `${member.user.username} says "${transcript}"`);
       }
 
-      // Pass the actual message object to getAIResponse
-      await getAIResponse(transcript, currentConnection, context.message, true, member);
+      // Append the transcript in the format "username: message"
+      accumulatedTranscript += `${member.user.username}: ${transcript}\n`;
+
+      // Reset the accumulation timer so that we combine transcripts received close together.
+      if (accumulationTimer) clearTimeout(accumulationTimer);
+      accumulationTimer = setTimeout(() => {
+        // When no new transcript comes in within 2 seconds, send the accumulated prompt.
+        // Using the last member info for logging purposes.
+        getAIResponse(accumulatedTranscript, currentConnection, context.message, true, member);
+        accumulatedTranscript = "";
+        accumulationTimer = null;
+      }, 2000);
 
     } catch (error) {
       console.error(`Error processing audio from ${member.user.username}:`, error);
@@ -433,16 +447,15 @@ async function transcribeAudio(buffer) {
  * Get the AI response for a given prompt.
  */
 async function getAIResponse(prompt, connection, message, autoRestart, member) {
-  console.log(`Getting AI response for ${member.user.username}:`, prompt);
-  console.log("Message: ", JSON.stringify(message, null, 2));
-
+  console.log(`Getting AI response for combined prompt:`, prompt);
+  // Note: 'member' here is the last speaker who triggered a transcript.
   try {
     let response = null;
     // Retrieve or create conversation context
     let chatId = userConversations.get(process.env.CHARACTER_ID);
 
     if (!chatId) {
-      console.log("No chat found for user, starting a new one...");
+      console.log("No chat found for conversation, starting a new one...");
       const chats = await caiClient.character.connect(process.env.CHARACTER_ID);
       const chatList = chats["chats"];
       chatId = chatList[0]["chat_id"];
@@ -460,9 +473,9 @@ async function getAIResponse(prompt, connection, message, autoRestart, member) {
         chat_id: chatId,
         timeout_ms: 30000,
       });
-      console.log(`Response for ${member.user.username}:`, JSON.stringify(response, null, 2));
+      console.log(`Response:`, JSON.stringify(response, null, 2));
     } catch (error) {
-      console.log(`Error sending message for ${member.user.username}:`, error);
+      console.log(`Error sending message:`, error);
       if (!response) {
         await caiClient.character.disconnect(process.env.CHARACTER_ID);
         console.log("Disconnected...trying again.");
@@ -470,7 +483,6 @@ async function getAIResponse(prompt, connection, message, autoRestart, member) {
     }
 
     if (announce_in_channel && message) {
-      console.log("***Response is: ");
       const ai_response = response["turn"]["candidates"][0]["raw_content"];
       const ai_name = response["turn"]["author"]["name"];
       console.log(ai_name, ": ", ai_response);
@@ -483,29 +495,29 @@ async function getAIResponse(prompt, connection, message, autoRestart, member) {
     let ttsReply = await caiClient.character.replay_tts(
       turnId, candidateId, process.env.VOICE_ID,
     );
-    console.log(`TTS Reply for ${member.user.username}:`, JSON.stringify(ttsReply, null, 2));
+    console.log(`TTS Reply:`, JSON.stringify(ttsReply, null, 2));
 
     if (!ttsReply["replayUrl"]) {
-      console.error(`TTS reply did not contain a replayUrl for ${member.user.username}, skipping TTS playback.`);
+      console.error(`TTS reply did not contain a replayUrl, skipping TTS playback.`);
       return;
     }
     const replayUrl = ttsReply["replayUrl"];
 
-    console.log(`Streaming file ${replayUrl} for ${member.user.username} from:`, replayUrl);
+    console.log(`Streaming file from:`, replayUrl);
     const ttsStreamResponse = await axios.get(replayUrl, { responseType: 'stream' });
 
-    console.log(`Queueing playback for ${member.user.username}...`);
+    console.log(`Queueing playback...`);
     audioQueue.push({ connection, stream: ttsStreamResponse.data, message, autoRestart });
     processAudioQueue();
 
     if (play_in_channel && message && typeof message.reply === 'function') {
       sendReply(message, `Now playing: ${replayUrl}`);
     }
-    console.log(`TTS Reply for ${member.user.username}:`, JSON.stringify(ttsReply, null, 2));
+    console.log(`TTS Reply:`, JSON.stringify(ttsReply, null, 2));
 
     return response;
   } catch (error) {
-    console.error(`Error getting AI response for ${member.user.username}:`, error);
+    console.error(`Error getting AI response:`, error);
     throw error;
   }
 }
