@@ -161,6 +161,7 @@ client.on('messageCreate', async message => {
   
   if (command === 'leave') {
     leaveVoiceChannelHandler(message);
+    await caiClient.character.disconnect(process.env.CHARACTER_ID);
   }
 });
 
